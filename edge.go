@@ -272,7 +272,7 @@ func handleMissingFile(c *gin.Context, filePath string) {
     cleaned := strings.Replace(filePath, config.Webroot, "", 1)
     cleaned = strings.TrimPrefix(cleaned, "/")
     cleaned = strings.TrimPrefix(cleaned, "lfs/")
-    originURL := fmt.Sprintf("%s/origin/%s", Config.Failed302,cleaned)
+    originURL := fmt.Sprintf("%s/origin/%s", config.Failed302,cleaned)
     fmt.Printf("Local file missing. Fetching from origin: %s\n", originURL)
 
     // 3) Attempt to download from origin.

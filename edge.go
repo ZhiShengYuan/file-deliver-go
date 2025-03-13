@@ -273,38 +273,74 @@ func handleMissingFile(c *gin.Context, filePath string) {
     cleaned = strings.TrimPrefix(cleaned, "/")
     cleaned = strings.TrimPrefix(cleaned, "lfs/")
     originURL := fmt.Sprintf("%s/origin/%s", Config.Failed302,cleaned)
-    fmt.Printf("Local file missing. Redirecting client to origin: %s\n", originURL)
+    fmt.Printf("Local file missing. Fetching from origin: %s\n", originURL)
 
-    // 3) Launch background download of the file.
-    go func(filePath, originURL string) {
-        resp, err := http.Get(originURL)
-        if err != nil {
-            fmt.Printf("Error fetching from origin in background: %v\n", err)
-            return
+    // 3) Attempt to download from origin.
+    resp, err := http.Get(originURL)
+    if err != nil {
+        fmt.Printf("Error fetching from origin: %v\n", err)
+        c.String(http.StatusInternalServerError, "Error fetching file from origin")
+        return
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode == http.StatusNotFound {
+        expiry := time.Now().Add(notExistCacheDuration)
+        nonExistentCache.Store(filePath, expiry)
+        fmt.Printf("Origin returned 404. Caching non-existence until %v and returning 404.\n", expiry)
+        c.String(http.StatusNotFound, "File not found (origin 404)")
+        return
+    } else if resp.StatusCode != http.StatusOK {
+        fmt.Printf("Origin responded with %d. Serving error status.\n", resp.StatusCode)
+        c.String(resp.StatusCode, "Error fetching file from origin")
+        return
+    }
+
+    // 4) Prepare to stream content and save a local copy.
+    // Disable range requests support by not forwarding "Accept-Ranges" header.
+    for key, values := range resp.Header {
+        if strings.EqualFold(key, "Accept-Ranges") {
+            continue
         }
-        defer resp.Body.Close()
+        // For simplicity, copy only the first value.
+        c.Header(key, values[0])
+    }
 
-        if resp.StatusCode == http.StatusNotFound {
-            expiry := time.Now().Add(notExistCacheDuration)
-            nonExistentCache.Store(filePath, expiry)
-            fmt.Printf("Background download: origin returned 404. Caching non-existence until %v.\n", expiry)
-            return
-        } else if resp.StatusCode != http.StatusOK {
-            fmt.Printf("Background download: origin responded with status %d.\n", resp.StatusCode)
-            return
+    // Create a temporary file for caching.
+    tmpPath := filePath + ".tmp"
+    tmpFile, err := os.Create(tmpPath)
+    if err != nil {
+        fmt.Printf("Error creating temporary file '%s': %v\n", tmpPath, err)
+        // Even if local caching fails, we still stream the file.
+    }
+
+    // If tmpFile is available, wrap the origin body with TeeReader.
+    var reader io.Reader = resp.Body
+    if tmpFile != nil {
+        reader = io.TeeReader(resp.Body, tmpFile)
+    }
+
+    // Write status code.
+    c.Status(http.StatusOK)
+
+    // Stream the content directly to the client.
+    if _, err := io.Copy(c.Writer, reader); err != nil {
+        fmt.Printf("Error streaming file to client: %v\n", err)
+    }
+
+    // Finalize local caching: close the temporary file and rename it.
+    if tmpFile != nil {
+        tmpFile.Close()
+        if err := os.Rename(tmpPath, filePath); err != nil {
+            fmt.Printf("Error renaming temporary file to '%s': %v\n", filePath, err)
+            os.Remove(tmpPath)
+        } else {
+            fileAccessTimes.Store(filePath, time.Now())
+            fmt.Printf("File saved locally: %s\n", filePath)
         }
-
-        if err := saveFileLocally(filePath, resp.Body); err != nil {
-            fmt.Printf("Error saving file locally in background: %v\n", err)
-            return
-        }
-        fileAccessTimes.Store(filePath, time.Now())
-        fmt.Printf("Background download complete and file cached: %s\n", filePath)
-    }(filePath, originURL)
-
-    // 4) Immediately redirect the client.
-    c.Redirect(http.StatusFound, originURL)
+    }
 }
+
 
 
 func saveFileLocally(filePath string, r io.Reader) error {
